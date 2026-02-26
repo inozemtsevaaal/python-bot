@@ -3,24 +3,24 @@ import logging
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from supabase import create_client, Client
 from dotenv import load_dotenv
+
+# Загружаем переменные окружения
 load_dotenv()
 
 # ===== НАСТРОЙКИ =====
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-SUPABASE_URL = os.getenv('SUPABASE_URL')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 YOUR_CHAT_ID = os.getenv('YOUR_CHAT_ID')
 
 # Проверка переменных
-if not all([BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, YOUR_CHAT_ID]):
-    raise ValueError("❌ ОШИБКА: Не все переменные окружения заданы!")
+if not BOT_TOKEN:
+    raise ValueError("❌ ОШИБКА: BOT_TOKEN не задан!")
+if not YOUR_CHAT_ID:
+    raise ValueError("❌ ОШИБКА: YOUR_CHAT_ID не задан!")
 
-# Supabase клиент
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# Хранилище состояний
+# ===== ЛОКАЛЬНОЕ ХРАНИЛИЩЕ КОРЗИН =====
+# Формат: { chat_id: [ {url: "...", name: "..."}, ... ] }
+carts = {}
 waiting_for_item = {}
 
 # Логирование
@@ -116,59 +116,129 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ===== ПОКАЗАТЬ КОРЗИНУ =====
     if data == 'show_cart':
-        try:
-            items = supabase.table('cart')\
-                .select('*')\
-                .eq('user_id', str(chat_id))\
-                .eq('status', 'active')\
-                .execute()
-            
-            if not items.data:
-                empty_keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➕ Добавить товар", callback_data='add_item')],
-                    [InlineKeyboardButton("◀️ Назад", callback_data='back_to_menu')]
-                ])
-                
-                await query.edit_message_media(
-                    media=InputMediaPhoto(
-                        media='https://buyera.ru/pictures/bot-cart.webp',
-                        caption="🛍 Ваша корзина пуста.\n\nНажмите 'Добавить товар', чтобы начать собирать заказ."
-                    ),
-                    reply_markup=empty_keyboard
-                )
-                return
-            
-            message = "🛍 <b>Ваша корзина:</b>\n\n"
-            for i, item in enumerate(items.data, 1):
-                message += f"{i}. {item.get('item_name', 'Товар')}\n"
-                message += f"🔗 {item['item_url']}\n"
-                message += "\n"
+        user_cart = carts.get(chat_id, [])
+        
+        if not user_cart:
+            empty_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить товар", callback_data='add_item')],
+                [InlineKeyboardButton("◀️ Назад", callback_data='back_to_menu')]
+            ])
             
             await query.edit_message_media(
                 media=InputMediaPhoto(
                     media='https://buyera.ru/pictures/bot-cart.webp',
-                    caption=message,
-                    parse_mode='HTML'
+                    caption="🛍 Ваша корзина пуста.\n\nНажмите 'Добавить товар', чтобы начать собирать заказ."
                 ),
-                reply_markup=get_cart_keyboard()
+                reply_markup=empty_keyboard
             )
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            await query.edit_message_caption(
-                caption="😕 Ошибка при загрузке корзины",
+            return
+        
+        message = "🛍 <b>Ваша корзина:</b>\n\n"
+        for i, item in enumerate(user_cart, 1):
+            message += f"{i}. {item.get('name', 'Товар')}\n"
+            message += f"🔗 {item['url']}\n"
+            message += "\n"
+        
+        await query.edit_message_media(
+            media=InputMediaPhoto(
+                media='https://buyera.ru/pictures/bot-cart.webp',
+                caption=message,
+                parse_mode='HTML'
+            ),
+            reply_markup=get_cart_keyboard()
+        )
+        return
+    
+    # ===== ПОДТВЕРЖДЕНИЕ ОТПРАВКИ =====
+    if data == 'confirm_checkout':
+        user_cart = carts.get(chat_id, [])
+        
+        if not user_cart:
+            await query.edit_message_media(
+                media=InputMediaPhoto(
+                    media='https://buyera.ru/pictures/bot-cart.webp',
+                    caption="🛍 Корзина пуста"
+                ),
                 reply_markup=get_back_keyboard()
             )
+            return
+        
+        warning = "⚠️ <b>Все ваши товары уже в корзине!</b>\n\nВы уверены, что готовы оформить заказ? Если корзина наполнена не до конца - вернитесь, когда все будет готово."
+        
+        await query.edit_message_media(
+            media=InputMediaPhoto(
+                media='https://buyera.ru/pictures/bot-cart.webp',
+                caption=warning,
+                parse_mode='HTML'
+            ),
+            reply_markup=get_confirm_keyboard()
+        )
+        return
+    
+    # ===== ОФОРМИТЬ ЗАКАЗ =====
+    if data == 'checkout':
+        user_cart = carts.get(chat_id, [])
+        
+        if not user_cart:
+            await query.edit_message_media(
+                media=InputMediaPhoto(
+                    media='https://buyera.ru/pictures/bot-cart.webp',
+                    caption="🛍 Корзина пуста"
+                ),
+                reply_markup=get_back_keyboard()
+            )
+            return
+        
+        # Отправляем заказ админу
+        order_text = f"📦 <b>НОВЫЙ ЗАКАЗ!</b>\n"
+        order_text += f"👤 Клиент: {user.full_name}\n"
+        order_text += f"🆔 ID: {chat_id}\n"
+        order_text += f"📱 Username: @{user.username if user.username else 'не указан'}\n"
+        order_text += f"📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+        order_text += f"<b>Товары в корзине:</b>\n"
+        
+        for i, item in enumerate(user_cart, 1):
+            order_text += f"{i}. {item['url']}\n"
+        
+        await context.bot.send_message(
+            chat_id=YOUR_CHAT_ID,
+            text=order_text,
+            parse_mode='HTML'
+        )
+        
+        # Очищаем корзину после отправки
+        carts[chat_id] = []
+        
+        await query.edit_message_media(
+            media=InputMediaPhoto(
+                media='https://buyera.ru/pictures/bot-order.webp',
+                caption="✅ Заказ отправлен! Алёна свяжется с вами"
+            ),
+            reply_markup=get_back_keyboard()
+        )
+        return
+    
+    # ===== ОЧИСТИТЬ КОРЗИНУ =====
+    if data == 'clear_cart':
+        carts[chat_id] = []
+        await query.edit_message_media(
+            media=InputMediaPhoto(
+                media='https://buyera.ru/pictures/bot-cart.webp',
+                caption="🛍 Корзина очищена"
+            ),
+            reply_markup=get_back_keyboard()
+        )
         return
     
     # ===== ПРОСТЫЕ ОТВЕТЫ =====
     responses = {
         'calc': "🔧 Калькулятор скоро появится!",
-        'rate': "💱 Курс: 1 юань = 12.5 ₽",
+        'rate': "💱 Курс: 1 юань = 12.5 ₽ (с комиссией)",
         'terms': "📋 Условия:\n• Поиск — бесплатно\n• Комиссия 10%\n• Доставка 14-25 дней",
         'platforms': "🛒 1688.com, Taobao, Tmall, Poizon, JD.com и другие",
         'contact': "📞 @inozemtsevaaal\n📧 buyer.alena@mail.ru",
         'review': "⭐️ Функция отзывов появится скоро!",
-        'privacy': "🔐 Политика конфиденциальности:\nhttps://buyera.ru/privacy.html"
+        'privacy': "🔐 Политика конфиденциальности:\n👉 https://buyera.ru/privacy.html"
     }
     
     if data in responses:
@@ -182,25 +252,48 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     text = update.message.text
     
+    # Проверяем, ждем ли мы ссылку
     if chat_id in waiting_for_item:
-        # Обработка ссылки на товар
+        bot_message_id = waiting_for_item[chat_id]
+        
         if 'http' not in text:
             await update.message.reply_text("❌ Это не похоже на ссылку. Попробуйте ещё раз")
             return
         
-        # Сохраняем в Supabase
-        supabase.table('cart').insert({
-            'user_id': str(chat_id),
-            'item_url': text,
-            'item_name': 'Товар по ссылке',
-            'status': 'active'
-        }).execute()
+        # Сохраняем товар в локальную корзину
+        if chat_id not in carts:
+            carts[chat_id] = []
         
-        await update.message.reply_text("✅ Товар добавлен в корзину!")
+        carts[chat_id].append({
+            'url': text,
+            'name': 'Товар по ссылке'
+        })
+        
+        # Удаляем сообщение пользователя со ссылкой
+        await update.message.delete()
+        
+        # Обновляем сообщение бота
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍 Посмотреть корзину", callback_data='show_cart')],
+            [InlineKeyboardButton("➕ Добавить ещё", callback_data='add_item')],
+            [InlineKeyboardButton("◀️ Главное меню", callback_data='back_to_menu')]
+        ])
+        
+        await context.bot.edit_message_media(
+            chat_id=chat_id,
+            message_id=bot_message_id,
+            media=InputMediaPhoto(
+                media='https://buyera.ru/pictures/bot-add.webp',
+                caption="✅ Товар добавлен в корзину!"
+            ),
+            reply_markup=keyboard
+        )
+        
         del waiting_for_item[chat_id]
     else:
         await update.message.reply_text("❓ Я не понимаю. Нажми /start")
 
+# ===== ЗАПУСК =====
 def main():
     """Запуск бота"""
     # Создаем приложение
